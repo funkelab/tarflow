@@ -28,12 +28,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Typing :: Typed",
 ]
-dependencies = [
-  "torch",
-  "jupyter>=1.0.0",
-  "torch-fidelity==0.3.0",
-  "torchmetrics==1.6.0",
-]
+dependencies = ["torch"]
 
 [dependency-groups]
 dev = [
