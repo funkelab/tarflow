@@ -5,6 +5,52 @@
 import torch
 
 
+def _prefix_alias(t: torch.Tensor, dim: int, length: int) -> torch.Tensor:
+    """Return `t[..., :length, ...]` along `dim` as a tensor that aliases the
+    same memory but owns an independent version counter.
+
+    A normal view shares its base's version counter, so any later write to the
+    buffer invalidates every prefix already saved for backward -- even when the
+    write lands in a region no saved prefix covers. Aliasing the storage
+    directly opts out of that check. See `_CacheWrite` for why it is safe.
+    """
+    v = t.narrow(dim, 0, length)
+    out = torch.empty(0, dtype=t.dtype, device=t.device)
+    out.set_(v.untyped_storage(), v.storage_offset(), v.shape, v.stride())
+    return out
+
+
+class _CacheWrite(torch.autograd.Function):
+    """Append one step's k (or v) to a preallocated cache, differentiably.
+
+    Each step writes `[pos, pos + n)` and reads back `[0, pos + n)`, so the
+    region a step writes is disjoint from every prefix earlier steps already
+    handed to attention. The buffer's contents are therefore still valid at
+    backward time, and all T steps can share a single allocation instead of
+    each materialising its own growing copy -- O(T) memory instead of O(T^2).
+
+    `prev` is the previous step's prefix, threaded through as a real graph edge
+    so that autograd accumulates each step's share of the gradient and orders
+    the backward nodes itself. Backward is then just a split: the first `pos`
+    positions belong to earlier steps, the last `n` to this one.
+    """
+
+    @staticmethod
+    def forward(ctx, prev, x, buf, pos, seq_dim):
+        n = x.size(seq_dim)
+        with torch.no_grad():
+            buf.narrow(seq_dim, pos, n).copy_(x)
+        ctx.pos, ctx.n, ctx.seq_dim = pos, n, seq_dim
+        ctx.has_prev = prev is not None
+        return _prefix_alias(buf, seq_dim, pos + n)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        pos, n, dim = ctx.pos, ctx.n, ctx.seq_dim
+        grad_prev = grad_out.narrow(dim, 0, pos) if ctx.has_prev else None
+        return grad_prev, grad_out.narrow(dim, pos, n), None, None, None
+
+
 class Permutation(torch.nn.Module):
     def __init__(self, seq_length: int):
         super().__init__()
@@ -42,8 +88,41 @@ class Attention(torch.nn.Module):
         self.num_heads = in_channels // head_channels
         self.sqrt_scale = head_channels ** (-0.25)
         self.sample = False
-        self.k_cache: dict[str, list[torch.Tensor]] = {"cond": [], "uncond": []}
-        self.v_cache: dict[str, list[torch.Tensor]] = {"cond": [], "uncond": []}
+        self.cache_max_len = 0
+        self.k_cache: dict[str, torch.Tensor | None] = {"cond": None, "uncond": None}
+        self.v_cache: dict[str, torch.Tensor | None] = {"cond": None, "uncond": None}
+        self.k_prefix: dict[str, torch.Tensor | None] = {"cond": None, "uncond": None}
+        self.v_prefix: dict[str, torch.Tensor | None] = {"cond": None, "uncond": None}
+        self.cache_len: dict[str, int] = {"cond": 0, "uncond": 0}
+
+    def _write_cache(
+        self, which_cache: str, k: torch.Tensor, v: torch.Tensor, seq_dim: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write k/v for the current step into a preallocated buffer along
+        `seq_dim` and return the valid (in-use) prefix of that buffer.
+
+        The buffer is allocated lazily on the first call (once we know the
+        batch size, dtype, device and per-token shape) with a fixed length of
+        `self.cache_max_len`, and filled in place step by step. The write goes
+        through `_CacheWrite` so that gradients flow back through the cache
+        without the buffer being copied per step.
+        """
+        pos = self.cache_len[which_cache]
+        if self.k_cache[which_cache] is None:
+            shape = list(k.shape)
+            shape[seq_dim] = self.cache_max_len
+            self.k_cache[which_cache] = k.new_zeros(shape)
+            self.v_cache[which_cache] = v.new_zeros(shape)
+        k_prefix = _CacheWrite.apply(
+            self.k_prefix[which_cache], k, self.k_cache[which_cache], pos, seq_dim
+        )
+        v_prefix = _CacheWrite.apply(
+            self.v_prefix[which_cache], v, self.v_cache[which_cache], pos, seq_dim
+        )
+        self.k_prefix[which_cache] = k_prefix
+        self.v_prefix[which_cache] = v_prefix
+        self.cache_len[which_cache] = pos + k.size(seq_dim)
+        return k_prefix, v_prefix
 
     def forward_spda(
         self,
@@ -62,12 +141,8 @@ class Attention(torch.nn.Module):
         )  # (b, h, t, d)
 
         if self.sample:
-            self.k_cache[which_cache].append(k)
-            self.v_cache[which_cache].append(v)
-            k = torch.cat(
-                self.k_cache[which_cache], dim=2
-            )  # note that sequence dimension is now 2
-            v = torch.cat(self.v_cache[which_cache], dim=2)
+            # note that sequence dimension is now 2
+            k, v = self._write_cache(which_cache, k, v, seq_dim=2)
 
         scale = self.sqrt_scale**2 / temp
         if mask is not None:
@@ -90,10 +165,7 @@ class Attention(torch.nn.Module):
         x = self.norm(x.float()).type(x.dtype)
         q, k, v = self.qkv(x).reshape(B, T, 3 * self.num_heads, -1).chunk(3, dim=2)
         if self.sample:
-            self.k_cache[which_cache].append(k)
-            self.v_cache[which_cache].append(v)
-            k = torch.cat(self.k_cache[which_cache], dim=1)
-            v = torch.cat(self.v_cache[which_cache], dim=1)
+            k, v = self._write_cache(which_cache, k, v, seq_dim=1)
 
         attn = (
             torch.einsum("bmhd,bnhd->bmnh", q * self.sqrt_scale, k * self.sqrt_scale)
@@ -292,12 +364,14 @@ class MetaBlock(torch.nn.Module):
 
         return xa, xb
 
-    def set_sample_mode(self, flag: bool = True):
+    def set_sample_mode(self, flag: bool = True, max_len: int = 0):
         for m in self.modules():
             if isinstance(m, Attention):
                 m.sample = flag
-                m.k_cache = {"cond": [], "uncond": []}
-                m.v_cache = {"cond": [], "uncond": []}
+                m.cache_max_len = max_len
+                m.k_cache = {"cond": None, "uncond": None}
+                m.v_cache = {"cond": None, "uncond": None}
+                m.cache_len = {"cond": 0, "uncond": 0}
 
     def reverse(
         self,
@@ -310,8 +384,8 @@ class MetaBlock(torch.nn.Module):
     ) -> torch.Tensor:
         x = self.permutation(x)
         pos_embed = self.permutation(self.pos_embed, dim=0)
-        self.set_sample_mode(True)
         T = x.size(1)
+        self.set_sample_mode(True, T - 1)
         for i in range(x.size(1) - 1):
             za, zb = self.reverse_step(x, pos_embed, i, y, which_cache="cond")
             if guidance > 0 and guide_what:
