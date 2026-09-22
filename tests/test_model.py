@@ -222,8 +222,8 @@ def test_reverse_resets_sample_mode() -> None:
     for m in model.modules():
         if isinstance(m, Attention):
             assert not m.sample
-            assert m.k_cache == {"cond": [], "uncond": []}
-            assert m.v_cache == {"cond": [], "uncond": []}
+            assert m.k_cache == {"cond": None, "uncond": None}
+            assert m.v_cache == {"cond": None, "uncond": None}
 
 
 def test_guidance() -> None:

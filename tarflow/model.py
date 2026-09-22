@@ -5,6 +5,52 @@
 import torch
 
 
+def _prefix_alias(t: torch.Tensor, dim: int, length: int) -> torch.Tensor:
+    """Return `t[..., :length, ...]` along `dim` as a tensor that aliases the
+    same memory but owns an independent version counter.
+
+    A normal view shares its base's version counter, so any later write to the
+    buffer invalidates every prefix already saved for backward -- even when the
+    write lands in a region no saved prefix covers. Aliasing the storage
+    directly opts out of that check. See `_CacheWrite` for why it is safe.
+    """
+    v = t.narrow(dim, 0, length)
+    out = torch.empty(0, dtype=t.dtype, device=t.device)
+    out.set_(v.untyped_storage(), v.storage_offset(), v.shape, v.stride())
+    return out
+
+
+class _CacheWrite(torch.autograd.Function):
+    """Append one step's k (or v) to a preallocated cache, differentiably.
+
+    Each step writes `[pos, pos + n)` and reads back `[0, pos + n)`, so the
+    region a step writes is disjoint from every prefix earlier steps already
+    handed to attention. The buffer's contents are therefore still valid at
+    backward time, and all T steps can share a single allocation instead of
+    each materialising its own growing copy -- O(T) memory instead of O(T^2).
+
+    `prev` is the previous step's prefix, threaded through as a real graph edge
+    so that autograd accumulates each step's share of the gradient and orders
+    the backward nodes itself. Backward is then just a split: the first `pos`
+    positions belong to earlier steps, the last `n` to this one.
+    """
+
+    @staticmethod
+    def forward(ctx, prev, x, buf, pos, seq_dim):
+        n = x.size(seq_dim)
+        with torch.no_grad():
+            buf.narrow(seq_dim, pos, n).copy_(x)
+        ctx.pos, ctx.n, ctx.seq_dim = pos, n, seq_dim
+        ctx.has_prev = prev is not None
+        return _prefix_alias(buf, seq_dim, pos + n)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        pos, n, dim = ctx.pos, ctx.n, ctx.seq_dim
+        grad_prev = grad_out.narrow(dim, 0, pos) if ctx.has_prev else None
+        return grad_prev, grad_out.narrow(dim, pos, n), None, None, None
+
+
 class Permutation(torch.nn.Module):
     def __init__(self, seq_length: int):
         super().__init__()
@@ -45,6 +91,8 @@ class Attention(torch.nn.Module):
         self.cache_max_len = 0
         self.k_cache: dict[str, torch.Tensor | None] = {"cond": None, "uncond": None}
         self.v_cache: dict[str, torch.Tensor | None] = {"cond": None, "uncond": None}
+        self.k_prefix: dict[str, torch.Tensor | None] = {"cond": None, "uncond": None}
+        self.v_prefix: dict[str, torch.Tensor | None] = {"cond": None, "uncond": None}
         self.cache_len: dict[str, int] = {"cond": 0, "uncond": 0}
 
     def _write_cache(
@@ -55,27 +103,27 @@ class Attention(torch.nn.Module):
 
         The buffer is allocated lazily on the first call (once we know the
         batch size, dtype, device and per-token shape) with a fixed length of
-        `self.cache_max_len`, and filled in place step by step.
+        `self.cache_max_len`, and filled in place step by step. The write goes
+        through `_CacheWrite` so that gradients flow back through the cache
+        without the buffer being copied per step.
         """
         pos = self.cache_len[which_cache]
-        n = k.size(seq_dim)
         if self.k_cache[which_cache] is None:
             shape = list(k.shape)
             shape[seq_dim] = self.cache_max_len
             self.k_cache[which_cache] = k.new_zeros(shape)
             self.v_cache[which_cache] = v.new_zeros(shape)
-        write_idx = [slice(None)] * k.dim()
-        write_idx[seq_dim] = slice(pos, pos + n)
-        write_idx = tuple(write_idx)
-        self.k_cache[which_cache][write_idx] = k
-        self.v_cache[which_cache][write_idx] = v
-        self.cache_len[which_cache] = pos + n
+        k_prefix = _CacheWrite.apply(
+            self.k_prefix[which_cache], k, self.k_cache[which_cache], pos, seq_dim
+        )
+        v_prefix = _CacheWrite.apply(
+            self.v_prefix[which_cache], v, self.v_cache[which_cache], pos, seq_dim
+        )
+        self.k_prefix[which_cache] = k_prefix
+        self.v_prefix[which_cache] = v_prefix
+        self.cache_len[which_cache] = pos + k.size(seq_dim)
+        return k_prefix, v_prefix
 
-        valid_idx = [slice(None)] * k.dim()
-        valid_idx[seq_dim] = slice(0, self.cache_len[which_cache])
-        valid_idx = tuple(valid_idx)
-        return self.k_cache[which_cache][valid_idx], self.v_cache[which_cache][valid_idx]
-    
     def forward_spda(
         self,
         x: torch.Tensor,
