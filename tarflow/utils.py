@@ -5,24 +5,15 @@
 __all__ = [
     'CosineLRSchedule',
     'Distributed',
-    'FID',
     'Metrics',
-    'get_data',
-    'set_random_seed',
 ]
 
 import datetime
 import math
 import os
-import pathlib
-import random
 
-import numpy as np
 import torch
 import torch.distributed
-import torch.utils.data
-import torchvision as tv
-from torchmetrics.image.fid import FrechetInceptionDistance
 
 
 class CosineLRSchedule(torch.nn.Module):
@@ -87,11 +78,6 @@ class Distributed:
             torch.distributed.destroy_process_group()
 
 
-class FID(FrechetInceptionDistance):
-    def add_state(self, name, default, *args, **kwargs):
-        self.register_buffer(name, default)
-
-
 class Metrics:
     def __init__(self):
         self.metrics: dict[str, list[float]] = {}
@@ -118,36 +104,3 @@ class Metrics:
     def print(metrics: dict[str, float], epoch: int):
         print(f'Epoch {epoch}  Time {datetime.datetime.now()}')
         print('\n'.join((f'\t{k:40s}: {v: .4g}' for k, v in sorted(metrics.items()))))
-
-
-def get_num_classes(dataset: str) -> int:
-    return {'imagenet64': 0, 'imagenet': 1000, 'afhq': 3}[dataset]
-
-
-def get_data(dataset: str, img_size: int, folder: pathlib.Path) -> tuple[torch.utils.data.Dataset, int]:
-    transform = tv.transforms.Compose(
-        [
-            tv.transforms.Resize(img_size),
-            tv.transforms.CenterCrop(img_size),
-            tv.transforms.RandomHorizontalFlip(),
-            tv.transforms.ToTensor(),
-            tv.transforms.Normalize((0.5,), (0.5,)),
-        ]
-    )
-    if dataset == 'imagenet64':
-        data = tv.datasets.ImageFolder(str(folder / 'imagenet64'), transform=transform)
-    elif dataset == 'imagenet':
-        data = tv.datasets.ImageFolder(str(folder / 'imagenet'), transform=transform)
-    elif dataset == 'afhq':
-        data = tv.datasets.ImageFolder(str(folder / 'afhq'), transform=transform)
-    else:
-        raise NotImplementedError(f'Unknown dataset {dataset}')
-    return data, get_num_classes(dataset)
-
-
-def set_random_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
